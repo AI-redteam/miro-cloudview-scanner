@@ -39,6 +39,49 @@ ALL_REGIONS = [
     "us-gov-east-1", "us-gov-west-1",
 ]
 
+# Human-readable display names for resource types (service:type -> label)
+RESOURCE_TYPE_LABELS = {
+    "ec2:instance": "EC2 Instance",
+    "ec2:vpc": "VPC",
+    "ec2:vpc-endpoint": "VPC Endpoint",
+    "ec2:subnet": "Subnet",
+    "ec2:route-table": "Route Table",
+    "ec2:internet-gateway": "Internet Gateway",
+    "ec2:nat-gateway": "NAT Gateway",
+    "ec2:transit-gateway": "Transit Gateway",
+    "ec2:volume": "EBS Volume",
+    "ec2:network-acl": "Network ACL",
+    "ec2:vpn-gateway": "VPN Gateway",
+    "ec2:network-interface": "Network Interface",
+    "lambda:function": "Lambda Function",
+    "s3:bucket": "S3 Bucket",
+    "dynamodb:table": "DynamoDB Table",
+    "rds:db": "RDS Instance",
+    "rds:cluster": "RDS Cluster",
+    "rds:proxy": "RDS Proxy",
+    "ecs:cluster": "ECS Cluster",
+    "ecs:service": "ECS Service",
+    "ecs:task": "ECS Task",
+    "eks:cluster": "EKS Cluster",
+    "elasticfilesystem:file-system": "EFS File System",
+    "elasticache:cluster": "ElastiCache Cluster",
+    "elasticache:replicationgroup": "ElastiCache Replication Group",
+    "elasticloadbalancing:loadbalancer": "Load Balancer",
+    "elasticloadbalancing:loadbalancer:application": "Application Load Balancer",
+    "elasticloadbalancing:targetgroup": "Target Group",
+    "sns:topic": "SNS Topic",
+    "sqs:queue": "SQS Queue",
+    "cloudtrail:trail": "CloudTrail Trail",
+    "cloudwatch:alarm": "CloudWatch Alarm",
+    "cloudwatch:metric-stream": "CloudWatch Metric Stream",
+    "autoscaling:autoScalingGroup": "Auto Scaling Group",
+    "athena:named-query": "Athena Named Query",
+    "es:domain": "OpenSearch Domain",
+    "redshift:cluster": "Redshift Cluster",
+    "route53:hostedzone": "Route 53 Hosted Zone",
+    "cloudfront:distribution": "CloudFront Distribution",
+}
+
 TAGGING_RESOURCE_TYPES = [
     "athena:named-query", "autoscaling:group", "cloudtrail:trail",
     "cloudwatch:alarm", "cloudwatch:metric-stream", "dynamodb:table",
@@ -91,6 +134,93 @@ def get_name_from_arn(resource_full: str, resource_type: str) -> str:
     if resource_full.startswith(resource_type):
         return resource_full[len(resource_type) + 1:]
     return resource_full
+
+
+def get_friendly_name(arn: str, resource: dict, tags: dict) -> str:
+    """
+    Derive a human-friendly display name for a resource.
+    Priority: Name tag > resource-specific name field > ARN-derived ID.
+    """
+    # 1. Check the Name tag (most common AWS naming convention)
+    resource_tags = tags.get(arn, {})
+    name_tag = resource_tags.get("Name", "")
+    if name_tag:
+        return name_tag
+
+    # 2. Check inline Tags on the resource itself (EC2, etc.)
+    for t in resource.get("Tags", resource.get("tags", [])):
+        if isinstance(t, dict) and t.get("Key") == "Name" and t.get("Value"):
+            return t["Value"]
+
+    # 3. Resource-specific name fields
+    for field in (
+        "Name",                   # Route53 hosted zones, S3 buckets
+        "FunctionName",           # Lambda
+        "DBInstanceIdentifier",   # RDS instance
+        "DBClusterIdentifier",    # RDS cluster
+        "DBProxyName",            # RDS proxy
+        "DomainName",             # OpenSearch, CloudFront
+        "LoadBalancerName",       # ELB v1/v2
+        "TargetGroupName",        # ELB target group
+        "AutoScalingGroupName",   # ASG
+        "ClusterIdentifier",      # Redshift
+        "TableName",              # DynamoDB
+        "FileSystemId",           # EFS
+        "TopicArn",               # SNS (use last segment)
+        "TrailName",              # CloudTrail (boto3 key)
+        "AlarmName",              # CloudWatch
+        "clusterName",            # ECS cluster
+        "serviceName",            # ECS service
+    ):
+        val = resource.get(field)
+        if val and isinstance(val, str):
+            # For ARN-style values, use just the last segment
+            if val.startswith("arn:"):
+                val = val.rsplit(":", 1)[-1]
+            return val
+
+    # 4. Fall back to the ARN-derived resource ID
+    parsed = parse_arn(arn)
+    res_str = parsed["resource"]
+    rtype = get_type_from_arn(parsed["service"], res_str)
+    return get_name_from_arn(res_str, rtype)
+
+
+def get_type_label(unified_type: str) -> str:
+    """Get a human-readable label for a unified resource type string."""
+    return RESOURCE_TYPE_LABELS.get(unified_type, unified_type)
+
+
+def _find_resource_by_id(resource_id: str, all_resources: dict) -> tuple[str | None, dict]:
+    """Find a resource ARN and data by a partial ID (e.g. vpc-123, subnet-456, sg-789)."""
+    for arn, data in all_resources.items():
+        if resource_id in arn:
+            return arn, data
+    return None, {}
+
+
+def get_container_name(resource_id: str, label: str, all_resources: dict, all_tags: dict) -> str:
+    """
+    Build a friendly container name like "VPC: my-production-vpc (vpc-12345678)".
+    Falls back to "VPC: vpc-12345678" if no Name tag is found.
+    """
+    arn, resource = _find_resource_by_id(resource_id, all_resources)
+
+    # Try Name tag from the tagging API
+    name = ""
+    if arn:
+        name = all_tags.get(arn, {}).get("Name", "")
+
+    # Try inline Tags on the resource
+    if not name:
+        for t in resource.get("Tags", resource.get("tags", [])):
+            if isinstance(t, dict) and t.get("Key") == "Name" and t.get("Value"):
+                name = t["Value"]
+                break
+
+    if name:
+        return f"{label}: {name} ({resource_id})"
+    return f"{label}: {resource_id}"
 
 
 def json_serial(obj: Any) -> Any:
@@ -959,12 +1089,16 @@ def process_data(all_resources: dict, all_tags: dict) -> dict:
         if pd is not None:
             placement[arn] = pd
 
-    # 2. Build processed resources
+    # 2. Build processed resources with friendly names and type labels
     processed_resources = {}
     for arn, pd in placement.items():
         unified_type = ":".join(filter(None, [pd["service"], pd["type"], pd["variant"]]))
+        type_label = get_type_label(unified_type)
+        friendly = get_friendly_name(arn, all_resources.get(arn, {}), all_tags)
+        # Show as "Lambda Function: my-func" so the resource is self-describing
+        display_name = f"{type_label}: {friendly}" if friendly != type_label else type_label
         processed_resources[arn] = {
-            "name": pd["name"],
+            "name": display_name,
             "type": unified_type,
             "tags": all_tags.get(arn, {}),
         }
@@ -990,7 +1124,7 @@ def process_data(all_resources: dict, all_tags: dict) -> dict:
         # Account
         if account and account not in containers["accounts"]:
             containers["accounts"][account] = {
-                "name": f"Account-{account}",
+                "name": f"AWS Account: {account}",
                 "children": {"resources": [], "regions": []},
             }
 
@@ -998,7 +1132,7 @@ def process_data(all_resources: dict, all_tags: dict) -> dict:
         region_id = f"{account}/{region}" if account and region else None
         if region_id and region_id not in containers["regions"]:
             containers["regions"][region_id] = {
-                "name": region,
+                "name": f"Region: {region}",
                 "children": {"resources": [], "vpcs": [], "availabilityZones": []},
             }
             if account in containers["accounts"]:
@@ -1007,7 +1141,7 @@ def process_data(all_resources: dict, all_tags: dict) -> dict:
         # VPC
         if vpc and vpc not in containers["vpcs"]:
             containers["vpcs"][vpc] = {
-                "name": vpc,
+                "name": get_container_name(vpc, "VPC", all_resources, all_tags),
                 "children": {"resources": [], "subnets": [], "securityGroups": []},
             }
             if region_id and region_id in containers["regions"]:
@@ -1018,7 +1152,7 @@ def process_data(all_resources: dict, all_tags: dict) -> dict:
             az_id = f"{account}/{az}"
             if az_id not in containers["availabilityZones"]:
                 containers["availabilityZones"][az_id] = {
-                    "name": az,
+                    "name": f"AZ: {az}",
                     "children": {"resources": [], "subnets": [], "securityGroups": []},
                 }
                 if region_id and region_id in containers["regions"]:
@@ -1028,7 +1162,7 @@ def process_data(all_resources: dict, all_tags: dict) -> dict:
         for sg in sgs:
             if sg not in containers["securityGroups"]:
                 containers["securityGroups"][sg] = {
-                    "name": sg,
+                    "name": get_container_name(sg, "Security Group", all_resources, all_tags),
                     "children": {"resources": []},
                 }
                 if vpc and vpc in containers["vpcs"]:
@@ -1044,16 +1178,18 @@ def process_data(all_resources: dict, all_tags: dict) -> dict:
                 # Find subnet resource data
                 subnet_arn = next((a for a in all_resources if subnet_id in a), None)
                 subnet_desc = all_resources.get(subnet_arn, {}) if subnet_arn else {}
+                subnet_type = "private" if is_subnet_private(subnet_desc) else "public"
+                subnet_label = f"Subnet ({subnet_type.title()})"
                 containers["subnets"][subnet_id] = {
-                    "name": subnet_id,
+                    "name": get_container_name(subnet_id, subnet_label, all_resources, all_tags),
                     "children": {"resources": []},
-                    "type": "private" if is_subnet_private(subnet_desc) else "public",
+                    "type": subnet_type,
                 }
                 sub_vpc = subnet_desc.get("VpcId")
                 if sub_vpc:
                     if sub_vpc not in containers["vpcs"]:
                         containers["vpcs"][sub_vpc] = {
-                            "name": sub_vpc,
+                            "name": get_container_name(sub_vpc, "VPC", all_resources, all_tags),
                             "children": {"resources": [], "subnets": [], "securityGroups": []},
                         }
                         if region_id and region_id in containers["regions"]:
@@ -1064,7 +1200,7 @@ def process_data(all_resources: dict, all_tags: dict) -> dict:
                     sub_az_id = f"{account}/{sub_az}"
                     if sub_az_id not in containers["availabilityZones"]:
                         containers["availabilityZones"][sub_az_id] = {
-                            "name": sub_az,
+                            "name": f"AZ: {sub_az}",
                             "children": {"resources": [], "subnets": [], "securityGroups": []},
                         }
                         if region_id and region_id in containers["regions"]:
