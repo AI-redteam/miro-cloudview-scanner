@@ -39,49 +39,6 @@ ALL_REGIONS = [
     "us-gov-east-1", "us-gov-west-1",
 ]
 
-# Human-readable display names for resource types (service:type -> label)
-RESOURCE_TYPE_LABELS = {
-    "ec2:instance": "EC2 Instance",
-    "ec2:vpc": "VPC",
-    "ec2:vpc-endpoint": "VPC Endpoint",
-    "ec2:subnet": "Subnet",
-    "ec2:route-table": "Route Table",
-    "ec2:internet-gateway": "Internet Gateway",
-    "ec2:nat-gateway": "NAT Gateway",
-    "ec2:transit-gateway": "Transit Gateway",
-    "ec2:volume": "EBS Volume",
-    "ec2:network-acl": "Network ACL",
-    "ec2:vpn-gateway": "VPN Gateway",
-    "ec2:network-interface": "Network Interface",
-    "lambda:function": "Lambda Function",
-    "s3:bucket": "S3 Bucket",
-    "dynamodb:table": "DynamoDB Table",
-    "rds:db": "RDS Instance",
-    "rds:cluster": "RDS Cluster",
-    "rds:proxy": "RDS Proxy",
-    "ecs:cluster": "ECS Cluster",
-    "ecs:service": "ECS Service",
-    "ecs:task": "ECS Task",
-    "eks:cluster": "EKS Cluster",
-    "elasticfilesystem:file-system": "EFS File System",
-    "elasticache:cluster": "ElastiCache Cluster",
-    "elasticache:replicationgroup": "ElastiCache Replication Group",
-    "elasticloadbalancing:loadbalancer": "Load Balancer",
-    "elasticloadbalancing:loadbalancer:application": "Application Load Balancer",
-    "elasticloadbalancing:targetgroup": "Target Group",
-    "sns:topic": "SNS Topic",
-    "sqs:queue": "SQS Queue",
-    "cloudtrail:trail": "CloudTrail Trail",
-    "cloudwatch:alarm": "CloudWatch Alarm",
-    "cloudwatch:metric-stream": "CloudWatch Metric Stream",
-    "autoscaling:autoScalingGroup": "Auto Scaling Group",
-    "athena:named-query": "Athena Named Query",
-    "es:domain": "OpenSearch Domain",
-    "redshift:cluster": "Redshift Cluster",
-    "route53:hostedzone": "Route 53 Hosted Zone",
-    "cloudfront:distribution": "CloudFront Distribution",
-}
-
 TAGGING_RESOURCE_TYPES = [
     "athena:named-query", "autoscaling:group", "cloudtrail:trail",
     "cloudwatch:alarm", "cloudwatch:metric-stream", "dynamodb:table",
@@ -134,62 +91,6 @@ def get_name_from_arn(resource_full: str, resource_type: str) -> str:
     if resource_full.startswith(resource_type):
         return resource_full[len(resource_type) + 1:]
     return resource_full
-
-
-def get_friendly_name(arn: str, resource: dict, tags: dict) -> str:
-    """
-    Derive a human-friendly display name for a resource.
-    Priority: Name tag > resource-specific name field > ARN-derived ID.
-    """
-    # 1. Check the Name tag (most common AWS naming convention)
-    resource_tags = tags.get(arn, {})
-    name_tag = resource_tags.get("Name", "")
-    if name_tag:
-        return name_tag
-
-    # 2. Check inline Tags on the resource itself (EC2, etc.)
-    for t in resource.get("Tags", resource.get("tags", [])):
-        if isinstance(t, dict) and t.get("Key") == "Name" and t.get("Value"):
-            return t["Value"]
-
-    # 3. Resource-specific name fields
-    for field in (
-        "Name",                   # Route53 hosted zones, S3 buckets
-        "FunctionName",           # Lambda
-        "DBInstanceIdentifier",   # RDS instance
-        "DBClusterIdentifier",    # RDS cluster
-        "DBProxyName",            # RDS proxy
-        "DomainName",             # OpenSearch, CloudFront
-        "LoadBalancerName",       # ELB v1/v2
-        "TargetGroupName",        # ELB target group
-        "AutoScalingGroupName",   # ASG
-        "ClusterIdentifier",      # Redshift
-        "TableName",              # DynamoDB
-        "FileSystemId",           # EFS
-        "TopicArn",               # SNS (use last segment)
-        "TrailName",              # CloudTrail (boto3 key)
-        "AlarmName",              # CloudWatch
-        "clusterName",            # ECS cluster
-        "serviceName",            # ECS service
-    ):
-        val = resource.get(field)
-        if val and isinstance(val, str):
-            # For ARN-style values, use just the last segment
-            if val.startswith("arn:"):
-                val = val.rsplit(":", 1)[-1]
-            return val
-
-    # 4. Fall back to the ARN-derived resource ID
-    parsed = parse_arn(arn)
-    res_str = parsed["resource"]
-    rtype = get_type_from_arn(parsed["service"], res_str)
-    return get_name_from_arn(res_str, rtype)
-
-
-def get_type_label(unified_type: str) -> str:
-    """Get a human-readable label for a unified resource type string."""
-    return RESOURCE_TYPE_LABELS.get(unified_type, unified_type)
-
 
 
 def json_serial(obj: Any) -> Any:
@@ -1058,16 +959,12 @@ def process_data(all_resources: dict, all_tags: dict) -> dict:
         if pd is not None:
             placement[arn] = pd
 
-    # 2. Build processed resources with friendly names and type labels
+    # 2. Build processed resources
     processed_resources = {}
     for arn, pd in placement.items():
         unified_type = ":".join(filter(None, [pd["service"], pd["type"], pd["variant"]]))
-        type_label = get_type_label(unified_type)
-        friendly = get_friendly_name(arn, all_resources.get(arn, {}), all_tags)
-        # Show as "Lambda Function: my-func" so the resource is self-describing
-        display_name = f"{type_label}: {friendly}" if friendly != type_label else type_label
         processed_resources[arn] = {
-            "name": display_name,
+            "name": pd["name"],
             "type": unified_type,
             "tags": all_tags.get(arn, {}),
         }
